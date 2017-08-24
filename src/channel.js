@@ -53,8 +53,11 @@ var ChannelEvent = {
 
 exports.ChannelEvent = ChannelEvent;
 
+var STD_ERR_BASE = 0x20000;
+
 var TcfError = {
-    ERR_PROTOCOL: 1
+    ERR_PROTOCOL: STD_ERR_BASE + 3,
+    ERR_CHANNEL_CLOSED: STD_ERR_BASE + 5,
 };
 
 var ESC = 3;
@@ -91,6 +94,7 @@ function Channel(protocol) {
     var proto;
     var svcList;
     var hasZeroCopySupport = false;
+    var eof = false;
 
     setProtocol(protocol);
 
@@ -113,7 +117,6 @@ function Channel(protocol) {
         var pres =  new promise(function(resolve, reject) {
             var rh = {};
             var i;
-            var ibin_arg;
             tokenId++;
             writeStringz("C");
             writeStringz(JSONbig.stringify(tokenId));
@@ -150,9 +153,11 @@ function Channel(protocol) {
         else if (ch == MARKER_EOS) {
             obuf[owrite++] = ESC;
             obuf[owrite++] = 2;
-            flushOutput();
         }
-        else obuf[owrite++] = ch;
+        else {
+            obuf[owrite++] = ch;
+        }
+        
         return 0;
     };
 
@@ -229,6 +234,8 @@ function Channel(protocol) {
 
     var readStream = function readStream() {
         var ch;
+        if (iread === ibuf.length && eof) return MARKER_EOS;
+
         utils.assert(iread < ibuf.length);
         // check for escape character
         if ((ch = ibuf[iread++]) == ESC) {
@@ -303,7 +310,7 @@ function Channel(protocol) {
         } while (ch != MARKER_EOM);
     };
 
-    var handleProtocolMessage = function handleProtocolMessage() {
+    function handleProtocolMessage() {
         var msg = {},
             arg,
             ch,
@@ -314,7 +321,7 @@ function Channel(protocol) {
         msg.type = readStringz();
 
         if (msg.type.length < 1) {
-            error = TcfError.ERR_PROTOCOL;
+            throw TcfError.ERR_PROTOCOL;
         }
         else if (msg.type == "C") {
             var token = readStringz();
@@ -345,8 +352,8 @@ function Channel(protocol) {
                 writeStream(MARKER_EOM);
             })
             .catch(function(err) {
-                // close the channel
                 console.log ('TCF protocol Error', err);
+                sendEofAndClose();
             });
         }
         else if ((msg.type == "R") || (msg.type == "P") || (msg.type == "N")) {
@@ -354,6 +361,11 @@ function Channel(protocol) {
             msg.token = readStringz();
             // get the reply handler
             var rh = popReplyHandler(msg.token);
+
+            if (!rh) {
+                throw TcfError.ERR_PROTOCOL;
+            }
+
             msg.res = {};
             res_idx = 0;
             // build the result object
@@ -377,7 +389,7 @@ function Channel(protocol) {
             }
             // skip EOM
             readStream();
-            rh.resolve(rargs);
+            rh.resolve && rh.resolve(rargs);
         }
         else if (msg.type == "E") {
             msg.service = readStringz();
@@ -408,25 +420,40 @@ function Channel(protocol) {
             }
         }
         else {
-            error = TcfError.ERR_PROTOCOL;
-            if (log) console.error("Invalid TCF message" + msg.type);
+            if (log) console.error("Invalid TCF message " + msg);
+            throw TcfError.ERR_PROTOCOL;
         }
+
         if (log) console.log(JSONbig.stringify(msg));
     };
 
-    var updateMessageCount = function updateMessageCount(buf) {
+    function updateMessageCount(buf) {
         var i;
         for (i = 0; i < buf.byteLength; i++) {
             switch (buf[i]) {
                 case 1: //EOM
-                    setTimeout(handleProtocolMessage, 0);
+                    setTimeout(() => {
+
+                        try {
+                            handleProtocolMessage();
+                        }
+                        catch(error) {
+                            sendEofAndClose();
+                        }
+
+                    }, 0);
                     messageCount++;
                     break;
                 case 2: //EOS
+                    // Channel closed by remote peer
+                    eof = true;
+                    setTimeout(() => {
+                        channel.close();
+                    });
                     break;
             }
         }
-    };
+    }
 
     var sendHelloMessage = function sendHelloMessage() {
         utils.assert(state == ChannelState.Started || state == ChannelState.HelloReceived);
@@ -445,7 +472,13 @@ function Channel(protocol) {
     };
 
     function flushOutput() {
-        channel.flushOutput(obuf.slice(0, owrite));
+        try {
+            channel.flushOutput(obuf.slice(0, owrite));
+        }
+        catch(error) {
+            if (log) console.log(error);
+        }
+
         owrite = 0;
     }
 
@@ -491,49 +524,40 @@ function Channel(protocol) {
         }
     }
 
-    var sendCommandMarshal = function sendCommandMarshal(service, name, args_list, res_list, done, ibin_args, ibin_res) {
-        var rh = {};
-        var i;
-        var ibin_arg;
-        tokenId++;
-        writeStringz("C");
-        writeStringz(JSONbig.stringify(tokenId));
-        writeStringz(service);
-        writeStringz(name);
-        for (i = 0; i < args_list.length; i++) {
-            ibin_arg = false;
-            for (var j = 0; ibin_args && j < ibin_args.length; j++) {
-                if (ibin_args[j] == i) {
-                    ibin_arg = true;
-                    break;
-                }
+    function channelClosed() {
+        // Remove event handlers
+        eventHandlers.length = 0;
+        // Send an error to pending command handlers
+        replyHandlers.forEach((replyHandler, idx) => {
+            try {
+                replyHandler.reject(TcfError.ERR_CHANNEL_CLOSED);
             }
-            if (ibin_arg) {
-                writeStringz(JSONbig.stringify(btoa(args_list[i])));
+            catch(err) {
+                if (log) console.error('Exception handling reply:', err);
             }
-            else writeStringz(JSONbig.stringify(args_list[i]));
-        }
-        writeStream(MARKER_EOM);
-        rh.tokenId = tokenId;
-        rh.reply = done;
-        rh.progress = null;
-        rh.marshall = true;
-        rh.res_list = res_list;
-        rh.ibin_res = ibin_res;
-        rh.service = service;
-        rh.name = name;
-        replyHandlers.push(rh);
-        if (log) console.log(tokenId, service, name, args_list);
-        return 0;
-    };
-
+            if (state != ChannelState.Disconnected) {
+                /*
+                 * Keep the reply handler structure to intercept correctly the reply,
+                 * but do not call the handler.
+                 */
+                replyHandler.resolve = null;
+                replyHandler.progress = null;
+            }
+            else {
+                replyHandlers.splice(idx, 1);
+            }
+        })
+    }
+    
     function onClosed() {
         state = ChannelState.Disconnected;
+        channelClosed();
         notifyChannelEvent(ChannelEvent.onclose);
     }
 
     function onError(err) {
         state = ChannelState.Disconnected;
+        channelClosed();
         notifyChannelEvent(ChannelEvent.onerror, err);
     }
 
@@ -541,6 +565,18 @@ function Channel(protocol) {
         utils.assert(state == ChannelState.StartWait || state == ChannelState.Disconnected);
         svcList = protocol ? protocol.getServiceList() : [];
         proto = protocol;
+    }
+
+    function sendEofAndClose() {
+        if (state === ChannelState.Disconnected) return;
+
+        writeStream(MARKER_EOS);
+        writeStream(0);
+        writeStream(MARKER_EOM);
+
+        state = ChannelState.Disconnected;
+
+        channel.closeConnection();
     }
 
     var channel = {
@@ -562,17 +598,7 @@ function Channel(protocol) {
         flushOutput: null,      // set by the transport layer
         closeConnection: null,  // set by the transport layer
 
-        close: function() {
-            if (state === ChannelState.Disconnected) return;
-
-            writeStream(MARKER_EOS);
-            writeStringz("null");
-            writeStream(MARKER_EOM);
-
-            state = ChannelState.Disconnected;
-
-            this.closeConnection();
-        },
+        close: sendEofAndClose,
 
         addHandler: function(ev, cb) {
             if (typeof listeners[ev] == "undefined") listeners[ev] = [];

@@ -1,7 +1,7 @@
 /*
  * TCF Client interface
  *
- * Copyright (c) 2016 Wind River Systems
+ * Copyright (c) 2016-2017 Wind River Systems
  *
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to deal
@@ -71,15 +71,67 @@ exports.Client = function Client(interfaces, protocol) {
     if (interfaces) {
         // Replace default remote service interfaces with specified ones
         svcItf = {};
-        interfaces.forEach(function(itf) {
+        interfaces.forEach(function (itf) {
             svcItf[itf.name] = itf;
         });
     }
 
+    var evs = {};
+    this.on = function on(ev, cb) {
+        if (!evs[ev]) evs[ev] = [];
+        evs[ev].push(cb);
+    }
+    
+    this.off = function off(ev, cb) {
+        if (!evs[ev]) return;
+        let i = evs[ev].indexOf(cb);
+        if (i) evs[ev].splice(i, 1);
+    }
+    
+    function emit(ev) {
+        evs[ev] && evs[ev].forEach ((cb) => {
+            try {
+                cb();
+            }
+            catch (err) {
+
+            };
+        });
+    }
+
+    /**
+     * Connection options - These are inherited from the tls.createSecureContext 
+     * {@link https://nodejs.org/api/tls.html#tls_tls_createsecurecontext_options}
+     * 
+     * @typedef {object} ConnectOptions 
+     */
+
     /**
      * Establishes the connection to the peer
      * @param {PeerUrl} url - string defining a peer url
-     * @param {object|null} - Option object or null
+     * @param {ConnectOptions |null} - Option object or null
+     * @return {Promise<Channel>} A promise to the channel.
+     */
+    this.connectDefered = function connectDefered(url, options) {
+        return new Promise((resolve, reject) => {
+            self.connect(url, options,
+                () => { resolve (self)},
+                () => {},
+                (error) => { reject(error)} 
+            );                
+        })
+    }
+
+    /**
+     * Connection options - These are inherited from the tls.createSecureContext 
+     * {@link https://nodejs.org/api/tls.html#tls_tls_createsecurecontext_options}
+     * 
+     * @typedef {object} ConnectOptions 
+     */
+    /**
+     * Establishes the connection to the peer
+     * @param {PeerUrl} url - string defining a peer url
+     * @param {ConnectOptions |null} - Option object or null
      * @param {function} - callback upon successfull connection
      * @param {function} - callback upon communication error
      * @param {function} - callback upon close
@@ -118,10 +170,12 @@ exports.Client = function Client(interfaces, protocol) {
                 // clear the proxies
                 self.svc = {};
                 if (onclose) setTimeout(onclose);
+                emit('closed');
             });
 
             c.addHandler(channel.ChannelEvent.onerror, function (err) {
                 if (onerror) onerror(err);
+                emit('error');
             });
 
             c.addHandler(channel.ChannelEvent.onconnect, function () {
@@ -195,6 +249,13 @@ exports.Client = function Client(interfaces, protocol) {
             c.close();
         }
     };
+
+    /**
+     * Closes the client communication channel
+     * 
+     * Alias to the close() method.
+     */    
+    this.disconnect = this.close;
 
     /**
      * Retreive the channel object associated with the Client
