@@ -63,7 +63,7 @@ var TcfError = {
 var ESC = 3;
 var MARKER_EOM = -1;
 var MARKER_EOS = -2;
-var OBUF_SIZE = 1024 * 128;
+var OBUF_SIZE = 1024 * 512;
 
 
 /**
